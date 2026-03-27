@@ -350,46 +350,109 @@ def call_bumblebee(prompt_template: str, query: str, candidates_by_category: Dic
 # ---------- SCORING ----------
 
 
-def score_response(text: str) -> dict:
-    """Score a BB response."""
+def score_response(text: str, query: str = "") -> dict:
+    """Score a BB response with better quality checks."""
     try:
         data = json.loads(text.strip())
         action = data.get("action", "")
         is_slate = action == "recommend_slate"
+        is_pass = action == "pass_talk"
         rows = data.get("rows", [])
-        has_followup = bool(data.get("followup") or data.get("message"))
-
-        # Title quality check
+        followup = data.get("followup") or data.get("message") or ""
+        
+        quality = 0
+        penalties = []
+        bonuses = []
+        
+        # --- STRUCTURAL CHECKS (max 3 pts) ---
+        if is_slate:
+            quality += 2  # picked something
+        elif is_pass:
+            quality += 1  # pass is valid but less valuable
+            # Penalize passing on clear emotional queries
+            clear_queries = ["lonely", "lost my", "stressed", "angry", "scared", "promoted", "dream school", "won the"]
+            if any(cq in query.lower() for cq in clear_queries):
+                penalties.append("unnecessary_pass")
+                quality -= 2
+        else:
+            penalties.append("invalid_action")
+        
+        # Diversity (max 2 pts)
+        if is_slate and len(rows) >= 3:
+            quality += 2
+            bonuses.append("good_diversity")
+        elif is_slate and len(rows) >= 2:
+            quality += 1
+        
+        # --- TITLE QUALITY (max 3 pts) ---
         good_titles = 0
+        bad_titles = []
+        generic_patterns = ["something for you", "might help", "to consider", "for tonight", "check this out"]
+        
         for row in rows:
             title = row.get("title", "")
-            if len(title) <= 60 and len(title.split()) <= 12 and title:
-                good_titles += 1
-
-        quality = 0
-        if is_slate:
-            quality += 4  # picked something
-            quality += min(len(rows), 3)  # diversity (up to 3 pts for 3+ rows)
-            quality += min(good_titles, 2)  # title quality (up to 2 pts)
-        if has_followup:
+            # Length check
+            if len(title) > 60 or len(title.split()) > 12:
+                bad_titles.append(f"too_long:{title[:20]}")
+                continue
+            # Generic title check
+            if any(gp in title.lower() for gp in generic_patterns):
+                bad_titles.append(f"generic:{title[:20]}")
+                continue
+            # Empty or very short
+            if len(title) < 5:
+                bad_titles.append("too_short")
+                continue
+            good_titles += 1
+        
+        if good_titles >= 3:
+            quality += 3
+        elif good_titles >= 2:
+            quality += 2
+        elif good_titles >= 1:
             quality += 1
+        
+        if bad_titles:
+            penalties.extend(bad_titles[:3])  # cap at 3
+        
+        # --- FOLLOWUP QUALITY (max 2 pts) ---
+        if followup:
+            quality += 1
+            # Bonus for specific followup (contains question mark and references query context)
+            if "?" in followup and len(followup) > 30:
+                quality += 1
+                bonuses.append("specific_followup")
+        
+        # --- CATEGORY DIVERSITY BONUS ---
+        categories_used = set(row.get("category", "") for row in rows)
+        if len(categories_used) >= 3:
+            bonuses.append("multi_category")
+        
+        # Cap at 10
+        quality = min(10, max(0, quality))
 
         return {
             "action": action,
             "rows": len(rows),
             "good_titles": good_titles,
-            "has_followup": has_followup,
+            "bad_titles": len(bad_titles),
+            "has_followup": bool(followup),
             "quality": quality,
             "valid_json": True,
+            "penalties": penalties,
+            "bonuses": bonuses,
         }
     except (json.JSONDecodeError, AttributeError):
         return {
             "action": "parse_error",
             "rows": 0,
             "good_titles": 0,
+            "bad_titles": 0,
             "has_followup": False,
             "quality": 0,
             "valid_json": False,
+            "penalties": ["json_parse_error"],
+            "bonuses": [],
         }
 
 
@@ -426,7 +489,7 @@ def main():
                 print("[MANUAL]")
                 continue
 
-            s = score_response(resp["text"])
+            s = score_response(resp["text"], q)
             avgs[v["name"]].append(s["quality"])
 
             with open(RESULTS_FILE, "a") as f:
@@ -461,6 +524,73 @@ def main():
         best = max(avgs.items(), key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 0)
         print(f"\n🏆 Best variant: {best[0]}")
     print(f"Results: {RESULTS_FILE}")
+    
+    # Write summary and auto-push
+    write_summary(avgs)
+    auto_push_results()
+
+
+def write_summary(avgs: dict):
+    """Write research_summary.md and winning_prompt.txt"""
+    summary_path = "/workspace/autoresearch/research_summary.md"
+    winning_path = "/workspace/autoresearch/winning_prompt.txt"
+    
+    if not avgs:
+        return
+    
+    best_name = max(avgs.items(), key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 0)[0]
+    
+    with open(summary_path, "w") as f:
+        f.write(f"# BB Optimization Run — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+        f.write("## Results\n\n")
+        f.write("| Variant | Avg Score | Slates | Notes |\n")
+        f.write("|---------|-----------|--------|-------|\n")
+        for name, scores in sorted(avgs.items(), key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 0, reverse=True):
+            avg = sum(scores) / len(scores) if scores else 0
+            slates = sum(1 for s in scores if s >= 4)
+            winner = "🏆" if name == best_name else ""
+            f.write(f"| {name} | {avg:.2f} | {slates}/{len(scores)} | {winner} |\n")
+        f.write(f"\n## Best: {best_name}\n")
+    
+    # Write winning prompt (find the variant)
+    for v in VARIANTS:
+        if v["name"] == best_name:
+            prompt = BUMBLEBEE_PROMPT
+            if v["prompt_mod"]:
+                prompt = v["prompt_mod"](prompt)
+            with open(winning_path, "w") as f:
+                f.write(f"# Winning Variant: {best_name}\n")
+                f.write(f"# Temperature: {v['temp']}\n")
+                f.write(f"# Description: {v['description']}\n\n")
+                f.write(prompt[:5000])  # First 5K chars
+            break
+    
+    print(f"\nSummary: {summary_path}")
+    print(f"Winning prompt: {winning_path}")
+
+
+def auto_push_results():
+    """Auto-push results to git so we don't lose them."""
+    import subprocess
+    try:
+        # Configure git if needed
+        subprocess.run(["git", "config", "--global", "user.email", "p.mojabi@gmail.com"], cwd="/workspace/autoresearch", capture_output=True)
+        subprocess.run(["git", "config", "--global", "user.name", "Pouria Mojabi"], cwd="/workspace/autoresearch", capture_output=True)
+        
+        # Add and commit
+        subprocess.run(["git", "add", "experiments_bb.jsonl", "research_summary.md", "winning_prompt.txt"], cwd="/workspace/autoresearch", capture_output=True)
+        result = subprocess.run(["git", "commit", "-m", f"BB run {datetime.now().strftime('%Y%m%d-%H%M')}"], cwd="/workspace/autoresearch", capture_output=True, text=True)
+        
+        if "nothing to commit" not in result.stdout + result.stderr:
+            # Push (will fail if no token, that's ok)
+            push = subprocess.run(["git", "push", "myfork", "master"], cwd="/workspace/autoresearch", capture_output=True, text=True, timeout=30)
+            if push.returncode == 0:
+                print("✅ Results auto-pushed to git")
+            else:
+                print(f"⚠️  Git push failed (no token?) — results saved locally")
+                print(f"   Run: git push myfork master")
+    except Exception as e:
+        print(f"⚠️  Auto-push error: {e}")
 
 
 if __name__ == "__main__":
