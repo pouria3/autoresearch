@@ -182,9 +182,9 @@ def get_candidates_by_category(query: str, per_cat: int = 15) -> Dict[str, List[
         for cat in CATEGORIES:
             cur.execute(
                 """
-                SELECT id, source, title, content
-                FROM chunks
-                WHERE source ILIKE %s AND content ILIKE %s
+                SELECT id, source, title, text
+                FROM content_chunks
+                WHERE source ILIKE %s AND text ILIKE %s
                 ORDER BY random()
                 LIMIT %s
                 """,
