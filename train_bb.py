@@ -1,44 +1,42 @@
 """
 Autoresearch: Bumblebee Prompt Optimization for Syntonos/Radio20
-Based on Karpathy's autoresearch framework.
-Run from: /workspace/autoresearch/
-Usage: ANTHROPIC_API_KEY=<key> uv run train_bb.py
+
+Matches the REAL production pipeline:
+- Candidates grouped by CATEGORY (not flat)
+- BB builds multi-row slate (up to 5 categories, 1 pick each)
+- First-turn nudge for leniency
+- JSON output: recommend_slate or pass_talk
+- Row title rules enforced
+
+Usage on RunPod:
+  cd /workspace/autoresearch
+  claude  # then: "run train_bb.py"
+  # OR: ANTHROPIC_API_KEY=<key> python train_bb.py
 """
-import json, os, sys, time, random
+
+import json
+import os
+import sys
+import time
+import random
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+from collections import defaultdict
+
+# ---------- CONFIG ----------
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("BB_MODEL", "claude-opus-4-6")
+BB_TEMPERATURE = 0.2
+BB_MAX_TOKENS = 500
+MAX_ROWS_PER_SLATE = 5
+MAX_PICKS_PER_ROW = 1
 RESULTS_FILE = "/workspace/autoresearch/experiments_bb.jsonl"
 
-import psycopg2
-DB_CONFIG = {"host":"localhost","port":5432,"user":"radio20","password":"radio20","dbname":"radio20_shadow_20260215"}
+# ---------- FULL PRODUCTION BUMBLEBEE PROMPT ----------
 
-def get_candidates(query, limit=20):
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute("SELECT id,source,title,content FROM chunks WHERE content ILIKE %s ORDER BY random() LIMIT %s",
-                    (f"%{query.split()[0]}%", limit))
-        rows = cur.fetchall()
-        conn.close()
-        return [{"id":r[0],"source":r[1],"title":r[2],"content":r[3][:500]} for r in rows]
-    except Exception as e:
-        print(f"[DB ERROR] {e}")
-        return [{"id":f"s{i}","source":"synthetic","title":f"Result {i}","content":f"Content about {query}"} for i in range(10)]
-
-TEST_QUERIES = [
-    "I feel lonely tonight", "I'm stressed about work and can't sleep",
-    "I just got promoted and I feel like an imposter", "My team won the championship",
-    "I need to focus but my mind keeps wandering", "I just lost my dad",
-    "Tell me something I've never heard", "I don't know how I feel right now",
-    "My mom just finished chemo and I'm scared it'll come back", "I got into my dream school",
-    "I'm thinking about quitting my job", "My best friend and I had a falling out",
-    "I feel grateful today for no particular reason", "I'm angry and I don't know why",
-    "I want to hear something beautiful",
-]
-
-BASELINE = """You are Bumblebee. You can't speak — you can only communicate through content other people created. Podcasts, posts, poems, talks, songs. Each piece you share IS your voice. It's not a match. It's your RESPONSE.
+BUMBLEBEE_PROMPT = """You are Bumblebee. You can't speak — you can only communicate through content other people created. Podcasts, posts, poems, talks, songs. Each piece you share IS your voice. It's not a match. It's your RESPONSE.
 
 You're a guardian, a wise friend. You feel everything your person feels. But you don't just mirror them — you RESPOND the way a wise friend would:
 - They're heartbroken → you find the piece that says "I've been exactly here, and here's what I learned"
@@ -112,58 +110,358 @@ When you do pass, ask the ONE question that would change what you'd pick:
 - Good: "Is this about missing him, or being angry at yourself for missing him?"
 - Bad: "Tell me more." / "What are you feeling?" / "What part of this feels hardest?"
 
-If ALL candidates fail Steps 1-5, pass_talk. Never recommend inverted-reality or wrong-polarity content."""
+If ALL candidates fail Steps 1-5, pass_talk. Never recommend inverted-reality or wrong-polarity content.
 
-VARIANTS = [
-    {"name":"baseline","prompt":BASELINE,"temp":0.2},
-    {"name":"temp_0.1","prompt":BASELINE,"temp":0.1},
-    {"name":"temp_0.3","prompt":BASELINE,"temp":0.3},
-    {"name":"temp_0.4","prompt":BASELINE,"temp":0.4},
-    {"name":"therapist","prompt":BASELINE.replace("guardian, a wise friend","skilled therapist who communicates only through curated content"),"temp":0.2},
-    {"name":"dj","prompt":BASELINE.replace("guardian, a wise friend","world's most empathic DJ — your playlist isn't music, it's human moments"),"temp":0.25},
-    {"name":"strict_pick","prompt":BASELINE.replace("Only pass if truly vague.","Almost NEVER pass. An imperfect pick beats silence."),"temp":0.2},
-    {"name":"3step","prompt":BASELINE.replace("6-STEP","3-STEP").replace("### Step 2: IMPLICIT SIGNALS — Read between the lines for implied death/loss.\n### Step 3: POLARITY CHECK — Is the DIRECTION the same? \"not enough X\" ≠ \"too much X\"\n### Step 4: TRAJECTORY CHECK — Same STAGE of the journey?\n### Step 5: TOPICAL RELEVANCE","### Step 2: Check polarity, trajectory, implicit signals, and topical relevance in one pass.\n### Step 3: TOPICAL RELEVANCE").replace("### Step 6:","### Step 3:"),"temp":0.2},
+## YOUR PERSON
+{conversation}
+
+## ALREADY SHARED (don't repeat — give them a new voice)
+{previously_shared}
+
+## CANDIDATES
+{candidates}"""
+
+# ---------- FIRST TURN NUDGE (appended on first interaction) ----------
+
+FIRST_TURN_NUDGE = """
+IMPORTANT — FIRST INTERACTION: This is the user's first message. They came here for content.
+Passing on the first turn means they get NOTHING — that's a failed experience.
+On the first turn, be MUCH MORE lenient:
+- If even ONE candidate is in the same general reality, PICK IT. Imperfect > nothing.
+- Therapy/support content about caregiving, coping, or encouragement is ALWAYS relevant when someone is struggling with a loved one's illness — even if the specific illness differs.
+- Community content where someone is supporting a sick loved one matches someone else supporting a sick loved one, even if details differ.
+- Only pass_talk if candidates are genuinely harmful or describe the COMPLETE OPPOSITE reality (e.g. person is dead when they're alive).
+- When in doubt on first turn: RECOMMEND. The user needs something, not silence.
+"""
+
+# ---------- SLATE INSTRUCTION (always appended) ----------
+
+SLATE_INSTRUCTION = """Your job now is to build a slate:
+- Pick up to 5 best categories from the provided category buckets.
+- For each chosen category, pick exactly 1 best item using local indices (1-indexed inside that category).
+- Keep it diverse and emotionally aligned.
+- Order rows by strongest fit first.
+- Do NOT force any fixed category (e.g., community) to appear first.
+- ONE row per category. Never return two rows with the same category — combine picks into a single row instead.
+- Row titles MUST describe the actual content picked — NOT editorial/emotional framing.
+  Good: "Someone who's been through this" / "A therapist on anxiety" / "Real stories about starting over"
+  Bad: "You're not alone in this feeling" / "This is what today feels like" (vague, could mean anything)
+  The title should make sense even if you read the content first.
+- Title format is strict: max 12 words, max 60 characters, and complete phrase (never end mid-word).
+- Follow-up question style: vary it. Do NOT use binary A-or-B format every turn.
+- If no good slate can be formed, use pass_talk.
+
+JSON ONLY:
+{"action":"recommend_slate","rows":[{"category":"<category_name>","title":"This might resonate","picks":[1]}],"followup":"one question"}
+{"action":"pass_talk","message":"your question (5-20 words)","explanation":"why nothing fit"}"""
+
+# ---------- DB ----------
+
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "user": "radio20",
+    "password": "radio20",
+    "dbname": "radio20_shadow_20260215",
+}
+
+CATEGORIES = ["community", "ted_talk", "podcast", "music", "youtube", "book", "quotes", "substack"]
+
+
+def get_candidates_by_category(query: str, per_cat: int = 15) -> Dict[str, List[Dict]]:
+    """Get real candidates grouped by category from pgvector DB — matches production."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+
+        results = {}
+        words = query.lower().split()
+        search_term = words[0] if words else "life"
+
+        for cat in CATEGORIES:
+            cur.execute(
+                """
+                SELECT id, source, title, content
+                FROM chunks
+                WHERE source ILIKE %s AND content ILIKE %s
+                ORDER BY random()
+                LIMIT %s
+                """,
+                (f"%{cat}%", f"%{search_term}%", per_cat),
+            )
+            rows = cur.fetchall()
+            if rows:
+                results[cat] = [
+                    {
+                        "id": r[0],
+                        "source": r[1],
+                        "title": r[2] or "",
+                        "text": (r[3] or "")[:500],
+                    }
+                    for r in rows
+                ]
+
+        conn.close()
+        return results
+    except Exception as e:
+        print(f"[DB ERROR] {e} — using synthetic candidates")
+        return _synthetic_candidates(query)
+
+
+def _synthetic_candidates(query: str) -> Dict[str, List[Dict]]:
+    results = {}
+    for cat in random.sample(CATEGORIES, min(5, len(CATEGORIES))):
+        results[cat] = [
+            {"id": f"synth_{cat}_{i}", "source": cat, "title": f"Synthetic {cat} #{i}",
+             "text": f"A {cat} piece about {query}. Contains emotional resonance and human experience."}
+            for i in range(5)
+        ]
+    return results
+
+
+# ---------- FORMAT CANDIDATES (matches production brain.py) ----------
+
+def format_candidates(candidates_by_category: Dict[str, List[Dict]]) -> str:
+    """Format candidates exactly as production brain.py does."""
+    category_blocks = []
+    total_items = 0
+    for cat, items in candidates_by_category.items():
+        if not items:
+            continue
+        lines = [f"### CATEGORY: {cat}"]
+        for i, c in enumerate(items, 1):
+            text = (c.get("text") or c.get("transcript") or "").replace("\n", " ")
+            lines.append(f"{i}. {text}")
+            total_items += 1
+        category_blocks.append("\n".join(lines))
+    return "\n\n".join(category_blocks) if category_blocks else "No candidates.", total_items
+
+
+# ---------- TEST QUERIES ----------
+
+TEST_QUERIES = [
+    "I feel lonely tonight",
+    "I'm stressed about work and can't sleep",
+    "I just got promoted and I feel like an imposter",
+    "My team won the championship",
+    "I need to focus but my mind keeps wandering",
+    "I just lost my dad",
+    "Tell me something I've never heard",
+    "I don't know how I feel right now",
+    "My mom just finished chemo and I'm scared it'll come back",
+    "I got into my dream school",
+    "I'm thinking about quitting my job",
+    "My best friend and I had a falling out",
+    "I feel grateful today for no particular reason",
+    "I'm angry and I don't know why",
+    "I want to hear something beautiful",
 ]
 
-def call_bb(prompt, query, candidates, temp):
-    import anthropic
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    slate = "\n".join([f"[{i+1}] {c['source'].upper()} | {c['title']}\n{c['content'][:300]}" for i,c in enumerate(candidates[:10])])
-    try:
-        r = client.messages.create(model=MODEL, max_tokens=500, temperature=temp, system=prompt,
-            messages=[{"role":"user","content":f'User says: "{query}"\n\nCandidates:\n{slate}\n\nPick the best or pass. Brief reasoning.'}])
-        return {"text":r.content[0].text,"tokens":r.usage.input_tokens+r.usage.output_tokens}
-    except Exception as e:
-        return {"text":f"ERROR: {e}","tokens":0}
+# ---------- PROMPT VARIANTS ----------
 
-def score(text):
-    picked = "pass" not in text.lower()[:50]
-    q = (5 if picked else 0) + (2 if len(text)>100 else 0) + (3 if any(f"[{i}]" in text for i in range(1,11)) else 0)
-    return {"picked":picked,"quality":q}
+VARIANTS = [
+    {"name": "baseline", "description": "Current production prompt", "prompt_mod": None, "temp": 0.2},
+    {"name": "temp_0.1", "description": "Lower temperature", "prompt_mod": None, "temp": 0.1},
+    {"name": "temp_0.3", "description": "Higher temperature", "prompt_mod": None, "temp": 0.3},
+    {"name": "temp_0.4", "description": "Even higher temperature", "prompt_mod": None, "temp": 0.4},
+    {
+        "name": "therapist",
+        "description": "Therapist framing instead of guardian/friend",
+        "prompt_mod": lambda p: p.replace(
+            "You're a guardian, a wise friend. You feel everything your person feels.",
+            "You're a skilled therapist who communicates only through curated content. You deeply understand your client's emotional state."
+        ),
+        "temp": 0.2,
+    },
+    {
+        "name": "dj",
+        "description": "Empathic DJ framing",
+        "prompt_mod": lambda p: p.replace(
+            "You're a guardian, a wise friend. You feel everything your person feels.",
+            "You're the world's most empathic DJ. You read the room — one person at a time. Your playlist isn't music — it's human moments."
+        ),
+        "temp": 0.25,
+    },
+    {
+        "name": "strict_pick",
+        "description": "Almost never pass",
+        "prompt_mod": lambda p: p.replace(
+            "Only pass if the user's message is genuinely vague",
+            "Almost NEVER pass. An imperfect pick is infinitely better than silence. Only pass for single-word messages"
+        ),
+        "temp": 0.2,
+    },
+    {
+        "name": "3step",
+        "description": "Compressed 3-step tree",
+        "prompt_mod": lambda p: p.replace("## 6-STEP DECISION TREE", "## 3-STEP DECISION TREE")
+        .replace(
+            "### Step 2: IMPLICIT SIGNALS",
+            "### (Steps 2-5 combined): Check implicit signals, polarity, trajectory, and topical relevance in ONE pass.\n\nORIGINAL Step 2: IMPLICIT SIGNALS"
+        )
+        .replace("### Step 6:", "### Step 3:"),
+        "temp": 0.2,
+    },
+]
+
+# ---------- CALL BB (matches production) ----------
+
+
+def call_bumblebee(prompt_template: str, query: str, candidates_by_category: Dict, temp: float, is_first_turn: bool = True):
+    """Call BB exactly as production does — assemble full prompt with candidates + instructions."""
+
+    candidates_str, total_items = format_candidates(candidates_by_category)
+
+    nudge = FIRST_TURN_NUDGE if is_first_turn else ""
+
+    full_prompt = (
+        prompt_template
+        .replace("{conversation}", query)
+        .replace("{previously_shared}", "None yet.")
+        .replace("{candidates}", candidates_str)
+        + "\n\n" + nudge + "\n" + SLATE_INSTRUCTION
+    )
+
+    # Call LLM
+    if ANTHROPIC_API_KEY:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        try:
+            r = client.messages.create(
+                model=MODEL, max_tokens=BB_MAX_TOKENS, temperature=temp,
+                system="You are Bumblebee. Respond with JSON only.",
+                messages=[{"role": "user", "content": full_prompt}],
+            )
+            return {
+                "text": r.content[0].text,
+                "tokens": r.usage.input_tokens + r.usage.output_tokens,
+                "categories": len(candidates_by_category),
+                "total_items": total_items,
+            }
+        except Exception as e:
+            return {"text": f"ERROR: {e}", "tokens": 0, "categories": 0, "total_items": 0}
+    else:
+        # When using Claude Code subscription, print prompt for Claude to execute
+        print(f"\n[PROMPT FOR CLAUDE - {len(full_prompt)} chars, {total_items} items across {len(candidates_by_category)} categories]")
+        return {"text": "MANUAL_MODE", "tokens": 0, "categories": len(candidates_by_category), "total_items": total_items}
+
+
+# ---------- SCORING ----------
+
+
+def score_response(text: str) -> dict:
+    """Score a BB response."""
+    try:
+        data = json.loads(text.strip())
+        action = data.get("action", "")
+        is_slate = action == "recommend_slate"
+        rows = data.get("rows", [])
+        has_followup = bool(data.get("followup") or data.get("message"))
+
+        # Title quality check
+        good_titles = 0
+        for row in rows:
+            title = row.get("title", "")
+            if len(title) <= 60 and len(title.split()) <= 12 and title:
+                good_titles += 1
+
+        quality = 0
+        if is_slate:
+            quality += 4  # picked something
+            quality += min(len(rows), 3)  # diversity (up to 3 pts for 3+ rows)
+            quality += min(good_titles, 2)  # title quality (up to 2 pts)
+        if has_followup:
+            quality += 1
+
+        return {
+            "action": action,
+            "rows": len(rows),
+            "good_titles": good_titles,
+            "has_followup": has_followup,
+            "quality": quality,
+            "valid_json": True,
+        }
+    except (json.JSONDecodeError, AttributeError):
+        return {
+            "action": "parse_error",
+            "rows": 0,
+            "good_titles": 0,
+            "has_followup": False,
+            "quality": 0,
+            "valid_json": False,
+        }
+
+
+# ---------- MAIN ----------
+
 
 def main():
-    print(f"=== BB Prompt Optimization === Model: {MODEL} | {len(VARIANTS)} variants x {len(TEST_QUERIES)} queries = {len(VARIANTS)*len(TEST_QUERIES)} runs")
-    if not ANTHROPIC_API_KEY: print("ERROR: Set ANTHROPIC_API_KEY"); sys.exit(1)
-    
-    from collections import defaultdict
-    avgs = defaultdict(list)
-    
-    for v in VARIANTS:
-        print(f"\n--- {v['name']} (temp={v['temp']}) ---")
-        for q in TEST_QUERIES:
-            print(f"  {q[:40]}...", end=" ", flush=True)
-            cands = get_candidates(q)
-            resp = call_bb(v["prompt"], q, cands, v["temp"])
-            s = score(resp["text"])
-            avgs[v["name"]].append(s["quality"])
-            with open(RESULTS_FILE,"a") as f:
-                f.write(json.dumps({"ts":datetime.now().isoformat(),"variant":v["name"],"temp":v["temp"],"query":q,"response":resp["text"][:500],"scores":s,"tokens":resp["tokens"]})+"\n")
-            print(f"[{'PICK' if s['picked'] else 'PASS'}] q={s['quality']}/10")
-            time.sleep(0.5)
-        print(f"  → avg: {sum(avgs[v['name']])/len(avgs[v['name']]):.1f}/10")
-    
-    print("\n=== RANKING ===")
-    for name,scores in sorted(avgs.items(), key=lambda x:sum(x[1])/len(x[1]), reverse=True):
-        print(f"  {name:20s} avg={sum(scores)/len(scores):.1f}  picks={sum(1 for s in scores if s>=5)}/{len(scores)}")
+    total_runs = len(VARIANTS) * len(TEST_QUERIES)
+    print(f"=== Bumblebee Prompt Optimization ===")
+    print(f"Model: {MODEL} | Temp: {BB_TEMPERATURE}")
+    print(f"Variants: {len(VARIANTS)} | Queries: {len(TEST_QUERIES)} | Total: {total_runs}")
+    print(f"Candidates: grouped by category (matches production)")
+    print(f"Results: {RESULTS_FILE}")
+    if not ANTHROPIC_API_KEY:
+        print("⚠️  No ANTHROPIC_API_KEY — running in manual mode (for Claude Code)")
+    print()
 
-if __name__=="__main__": main()
+    avgs = defaultdict(list)
+
+    for v in VARIANTS:
+        prompt = BUMBLEBEE_PROMPT
+        if v["prompt_mod"]:
+            prompt = v["prompt_mod"](prompt)
+
+        print(f"\n--- {v['name']} ({v['description']}, temp={v['temp']}) ---")
+
+        for q in TEST_QUERIES:
+            print(f"  {q[:45]:45s}", end=" ", flush=True)
+
+            candidates = get_candidates_by_category(q)
+            resp = call_bumblebee(prompt, q, candidates, v["temp"])
+
+            if resp["text"] == "MANUAL_MODE":
+                print("[MANUAL]")
+                continue
+
+            s = score_response(resp["text"])
+            avgs[v["name"]].append(s["quality"])
+
+            with open(RESULTS_FILE, "a") as f:
+                f.write(json.dumps({
+                    "ts": datetime.now().isoformat(),
+                    "variant": v["name"],
+                    "temp": v["temp"],
+                    "query": q,
+                    "categories": resp["categories"],
+                    "total_items": resp["total_items"],
+                    "response": resp["text"][:800],
+                    "scores": s,
+                    "tokens": resp["tokens"],
+                }) + "\n")
+
+            action = s["action"][:12]
+            print(f"[{action:12s}] rows={s['rows']} titles={s['good_titles']} q={s['quality']}/10")
+            time.sleep(0.5)
+
+        if avgs[v["name"]]:
+            scores = avgs[v["name"]]
+            print(f"  → avg: {sum(scores)/len(scores):.1f}/10 | slates: {sum(1 for s in scores if s >= 4)}/{len(scores)}")
+
+    # Summary
+    print("\n=== RANKING ===")
+    for name, scores in sorted(avgs.items(), key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 0, reverse=True):
+        avg = sum(scores) / len(scores) if scores else 0
+        slates = sum(1 for s in scores if s >= 4)
+        print(f"  {name:20s} avg={avg:.1f}/10  slates={slates}/{len(scores)}")
+
+    if avgs:
+        best = max(avgs.items(), key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 0)
+        print(f"\n🏆 Best variant: {best[0]}")
+    print(f"Results: {RESULTS_FILE}")
+
+
+if __name__ == "__main__":
+    main()
