@@ -20,7 +20,7 @@ from datetime import datetime
 
 # ---------- CONFIG ----------
 
-API_URL = "https://syntonos.ai/api/chat"
+API_URL = "http://localhost:8000/api/chat"  # localhost bypasses auth on RunPod
 RESULTS_FILE = "/workspace/autoresearch/experiments_bb.jsonl"
 
 # ---------- TEST QUERIES ----------
