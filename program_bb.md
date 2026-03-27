@@ -4,9 +4,10 @@ This is an experiment to find the optimal Bumblebee system prompt for Syntonos/R
 
 ## Setup
 
-1. Read `train_bb.py` for full context — it contains the production Bumblebee prompt, DB connection, candidate formatting, scoring, and test queries.
-2. Read the `BUMBLEBEE_PROMPT` variable — that's your baseline prompt. It's the real production prompt running on syntonos.ai right now.
-3. The database `content_chunks` table has ~3.2M rows of real content (TED talks, podcasts, community posts, music, books, youtube, quotes, substack).
+1. Read `train_bb.py` for the live API harness, test queries, and result logging.
+2. Make one successful `debug=true` call through the localhost endpoint. The returned `bumblebee_debug.prompt` is the real baseline prompt currently running on Syntonos.
+3. Save that returned prompt into `winning_prompt.txt` before making any edits. That file is your working draft.
+4. The live endpoint already runs the real production pipeline, so the returned behavior reflects actual search/rerank/Bumblebee output.
 
 ## What Bumblebee Does
 
@@ -14,7 +15,13 @@ Bumblebee is the curation LLM for Syntonos. A user shares how they're feeling �
 
 ## The File You Modify
 
-`train_bb.py` contains the `BUMBLEBEE_PROMPT` variable. That's the prompt you iterate on. Everything else (DB connection, scoring, test queries) stays fixed.
+`train_bb.py` is the harness. It does NOT contain a `BUMBLEBEE_PROMPT` variable.
+
+You modify:
+- `winning_prompt.txt` — your current best full prompt draft
+- `research_summary.md` — what you tried, what you observed, what you recommend next
+
+Do not ask the human to add a prompt variable to `train_bb.py`. Capture the live baseline from `bumblebee_debug.prompt` and work from there.
 
 ## How to Run
 
@@ -22,7 +29,7 @@ Bumblebee is the curation LLM for Syntonos. A user shares how they're feeling �
 python train_bb.py
 ```
 
-Each run tests the current prompt against all 15 test queries using real candidates from the database. Results append to `experiments_bb.jsonl`.
+Use `train_bb.py` as the live-eval harness. Each API call captures baseline behavior from the real system and appends results to `experiments_bb.jsonl`.
 
 ## The Metric
 
@@ -42,7 +49,7 @@ Higher is better. The baseline should score 7-9 on most queries.
 
 ## What You CAN Change
 
-Everything in the `BUMBLEBEE_PROMPT` string. This includes:
+Everything in your local working draft (`winning_prompt.txt`). This includes:
 - The persona/framing (guardian, friend, therapist, DJ, etc.)
 - The 6-step decision tree (reorder, merge, split, add, remove steps)
 - The examples and edge cases
@@ -52,7 +59,7 @@ Everything in the `BUMBLEBEE_PROMPT` string. This includes:
 - How follow-up questions are instructed
 - The emotional framing
 
-Also change the `FIRST_TURN_NUDGE` and `SLATE_INSTRUCTION` if you think they can be improved.
+Also include improved versions of related sub-instructions like first-turn nudges or slate instructions if you think they help.
 
 ## What You CANNOT Change
 
@@ -78,9 +85,9 @@ LOOP FOREVER:
 1. Run the current prompt against all 15 queries
 2. Analyze: where did BB fail? What patterns do you see?
 3. Form a hypothesis about what to change
-4. Modify the prompt
-5. Run again
-6. Compare to previous best. If better, keep. If worse, revert.
+4. Update `winning_prompt.txt` with a better full prompt draft
+5. Log the rationale in `research_summary.md`
+6. Keep sampling the live baseline behavior to gather stronger evidence and edge cases
 7. Log what you tried and what happened in research_summary.md
 8. Repeat
 

@@ -1,0 +1,2 @@
+# Capture the first successful `bumblebee_debug.prompt` here, then replace this
+# file with your current best full Bumblebee prompt draft as you iterate.

@@ -1,10 +1,10 @@
 """
 Autoresearch: Bumblebee Prompt Optimization for Syntonos
 
-Calls the production API at syntonos.ai/api/chat with debug=true to get:
-- The exact prompt sent to BB
+Calls the live Syntonos API with debug=true to get:
+- The exact prompt currently sent to BB
 - The exact response BB returned
-- All candidates considered
+- The current production behavior on real queries
 
 Claude Code analyzes the prompt/response pairs and suggests optimizations.
 
@@ -56,12 +56,8 @@ EDGE_QUERIES = [
 
 def call_syntonos_api(message: str, session_id: str = None) -> dict:
     """
-    Call the production Syntonos API with debug=true.
+    Call the live Syntonos API with debug=true.
     Returns the full response including bumblebee_debug.
-    
-    NOTE: This requires authentication. You may need to:
-    1. Get a valid auth token from syntonos.ai
-    2. Or use a test/dev endpoint that bypasses auth
     """
     payload = {
         "message": message,
@@ -131,8 +127,12 @@ CLAUDE: Here's how to do BB prompt optimization:
 1. CALL THE API
    Use call_syntonos_api(query) to send a test query.
    The response includes bumblebee_debug with:
-   - prompt: the exact prompt sent to BB
+   - prompt: the exact live prompt currently sent to BB
    - response: the exact JSON BB returned
+   
+   On your first successful call:
+   - copy bumblebee_debug.prompt into winning_prompt.txt
+   - treat that as the baseline prompt draft
 
 2. ANALYZE THE RESULTS
    Look at:
@@ -141,25 +141,29 @@ CLAUDE: Here's how to do BB prompt optimization:
    - Did BB pass when it should have picked?
    - Did BB pick when it should have passed?
 
-3. IDENTIFY THE PROMPT SECTION TO CHANGE
-   The BB prompt is in backend/brain.py on the production server.
-   Read the debug prompt to understand the current structure.
+3. IDENTIFY WHAT TO CHANGE
+   Read the debug prompt to understand the current production structure.
+   Identify which instructions, examples, thresholds, or framing choices are causing the failures.
    
 4. PROPOSE CHANGES
-   Write your proposed prompt modification to proposed_prompt.txt
-   Explain WHY you think it will improve results.
+   Update winning_prompt.txt with a stronger full prompt draft.
+   Write your reasoning and experiment notes to research_summary.md.
+   If useful, also write a focused delta to proposed_prompt.txt.
 
 5. TEST YOUR HYPOTHESIS
-   After the prompt is updated on the server, run the same queries
-   and compare before/after.
+   Keep calling the live API to gather more failure cases, more evidence,
+   and more edge conditions from the current production behavior.
+   This harness observes the live baseline; it does not automatically swap
+   your draft into production.
 
 6. ITERATE
    Keep testing and proposing until you can't improve anymore.
 
 IMPORTANT:
-- You cannot directly modify the production prompt
-- Your job is to ANALYZE and PROPOSE changes
-- The human will review and deploy your suggestions
+- train_bb.py is the harness, not the prompt source of truth
+- Do not ask the human to add a BUMBLEBEE_PROMPT variable to this file
+- The live baseline prompt comes from bumblebee_debug.prompt
+- Your job is to produce the strongest revised prompt text plus evidence-backed notes
 - Save all findings to experiments_bb.jsonl
 """
 
